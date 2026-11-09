@@ -47,7 +47,25 @@ Without a matching AutoCAD window, `auto` falls back to the headless ezdxf backe
 | `view` | `zoom_extents`, `zoom_window`, `get_screenshot` |
 | `system` | `status`, `health`, `get_backend`, `runtime`, `init`, `execute_lisp` |
 
-`plot_pdf`, `undo`, `redo`, `offset`, `fillet`, `chamfer` and `execute_lisp` need the File IPC backend. `execute_lisp` runs arbitrary AutoLISP in your AutoCAD session.
+`execute_lisp` runs arbitrary AutoLISP in your AutoCAD session.
+
+### Backend limits
+
+| Operation | File IPC (live AutoCAD) | ezdxf (headless) |
+|-----------|-------------------------|------------------|
+| `drawing`: `plot_pdf`, `undo`, `redo` | Yes | No |
+| `entity`: `offset`, `fillet`, `chamfer` | Yes | No |
+| `view`: `zoom_extents`, `zoom_window` | Yes | No |
+| `system`: `execute_lisp` | Yes | No |
+| `block`: `define` | No | Yes |
+| `pid`: `list_symbols` | Yes | Yes |
+| `pid`: every other operation | Needs `pid_tools.lsp`, see below | Yes, symbols are drawn as labelled placeholders |
+
+### P&ID on a live AutoCAD
+
+The dispatcher calls P&ID functions from `pid_tools.lsp`, which is not included in this repository. Until that file is loaded in AutoCAD, every `pid` operation except `list_symbols` returns `pid_tools.lsp not loaded`. The `attributes` argument of `insert_valve`, `insert_pump` and `insert_tank` is not applied on this backend.
+
+`lisp-code/attribute_tools.lsp` is an optional set of helper commands for use at the AutoCAD command line. The server does not need it.
 
 ## Environment variables
 
@@ -58,6 +76,8 @@ Without a matching AutoCAD window, `auto` falls back to the headless ezdxf backe
 | `AUTOCADSS_MCP_IPC_TIMEOUT` | `10` | Seconds to wait for one AutoCAD command (1-300) |
 | `AUTOCADSS_MCP_TOOL_TIMEOUT` | `60` | Seconds allowed for one whole tool call |
 | `AUTOCADSS_MCP_ONLY_TEXT` | `false` | Disable screenshots |
+| `AUTOCADSS_MCP_DEBUG_DETECT_FILE` | unset | Path of a file to write backend-detection details to, for troubleshooting |
+| `CTO_LIBRARY_PATH` | `C:/PIDv4-CTO` | P&ID symbol library folder. Used by the ezdxf backend only; the AutoLISP files always read `C:/PIDv4-CTO/` |
 
 ## Changes from autocad-mcp v3.1
 

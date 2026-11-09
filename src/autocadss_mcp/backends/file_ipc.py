@@ -411,7 +411,29 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("block-insert", {"name": name, "x": x, "y": y, "scale": scale, "rotation": rotation, "block_id": block_id})
 
     async def block_insert_with_attributes(self, name, x, y, scale=1.0, rotation=0.0, attributes=None) -> CommandResult:
-        return await self._dispatch("block-insert-with-attributes", {"name": name, "x": x, "y": y, "scale": scale, "rotation": rotation, "attributes": attributes or {}})
+        # The LISP JSON reader cannot parse a nested object, so the block is
+        # inserted first and each attribute is then set by handle.
+        result = await self._dispatch("block-insert-with-attributes", {"name": name, "x": x, "y": y, "scale": scale, "rotation": rotation})
+        if not result.ok or not attributes:
+            return result
+
+        handle = result.payload.get("handle") if isinstance(result.payload, dict) else None
+        if not handle:
+            return CommandResult(ok=False, error="Block inserted but no handle returned; attributes were not set")
+
+        applied: dict[str, str] = {}
+        failed: dict[str, str] = {}
+        for tag, value in attributes.items():
+            update = await self.block_update_attribute(handle, str(tag), str(value))
+            if update.ok:
+                applied[str(tag)] = str(value)
+            else:
+                failed[str(tag)] = update.error or "unknown error"
+
+        if failed:
+            details = "; ".join(f"{tag}: {err}" for tag, err in failed.items())
+            return CommandResult(ok=False, error=f"Block inserted (handle {handle}) but attributes failed: {details}")
+        return CommandResult(ok=True, payload={**result.payload, "attributes": applied})
 
     async def block_get_attributes(self, entity_id) -> CommandResult:
         return await self._dispatch("block-get-attributes", {"entity_id": entity_id})
