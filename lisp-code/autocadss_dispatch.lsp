@@ -1,4 +1,4 @@
-;;; autocadss_dispatch.lsp — File-based IPC dispatcher for AutoCAD MCP v3.1
+;;; autocadss_dispatch.lsp — File-based IPC dispatcher for AUTOCADSS MCP
 ;;;
 ;;; Protocol:
 ;;;   1. Python writes command JSON to C:/temp/autocadss_mcp_cmd_{id}.json
@@ -6,8 +6,13 @@
 ;;;   3. This function reads cmd, dispatches via command map, writes result JSON
 ;;;   4. Python polls for C:/temp/autocadss_mcp_result_{id}.json
 ;;;
-;;; SECURITY: No raw eval — dispatcher uses a command whitelist/map.
+;;; SECURITY: Commands go through a whitelist/map. The one exception is
+;;; "execute-lisp", which loads and runs an arbitrary .lsp file written by
+;;; the MCP server.
 ;;; Compatible with AutoCAD LT 2024+.
+;;;
+;;; This file is self-contained. The P&ID commands also need pid_tools.lsp,
+;;; which is not shipped; without it they return "pid_tools.lsp not loaded".
 
 ;; Load dependencies
 (if (not report-error)
@@ -164,7 +169,7 @@
 )
 
 ;; -----------------------------------------------------------------------
-;; Command dispatcher — WHITELIST ONLY, no eval
+;; Command dispatcher — whitelist; only "execute-lisp" runs arbitrary code
 ;; -----------------------------------------------------------------------
 
 (defun autocadss-dispatch-command (cmd-name params-json / result)
@@ -1026,7 +1031,7 @@
 
 ;; --- Block operations (insert-with-attributes, get-attributes, update-attribute) ---
 
-(defun mcp-cmd-block-insert-with-attribs (params / name x y scale rotation attributes ent)
+(defun mcp-cmd-block-insert-with-attribs (params / name x y scale rotation old-attreq)
   (setq name (mcp-json-get-string params "name"))
   (setq x (mcp-json-get-number params "x"))
   (setq y (mcp-json-get-number params "y"))
@@ -1036,9 +1041,12 @@
   (if (not rotation) (setq rotation 0.0))
   (if (tblsearch "BLOCK" name)
     (progn
-      ;; Insert with ATTREQ=1 to fill attributes
+      ;; Insert with ATTREQ=0 so INSERT does not stop at attribute prompts.
+      ;; Python then sets each value with block-update-attribute.
+      (setq old-attreq (getvar "ATTREQ"))
+      (setvar "ATTREQ" 0)
       (command "_.INSERT" name (list x y 0.0) scale scale rotation)
-      ;; Note: attribute values are applied separately via update-attribute
+      (setvar "ATTREQ" old-attreq)
       (cons T (strcat "{\"entity_type\":\"INSERT\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}")))
     (cons nil (strcat "Block '" name "' not found"))
   )
@@ -1069,22 +1077,36 @@
   )
 )
 
-(defun mcp-cmd-block-update-attribute (params / entity-id tag value ent)
+(defun mcp-cmd-block-update-attribute (params / entity-id tag value ent sub-ent ent-data found)
   (setq entity-id (mcp-json-get-string params "entity_id"))
   (setq tag (mcp-json-get-string params "tag"))
   (setq value (mcp-json-get-string params "value"))
   (if (= entity-id "last") (setq ent (entlast)) (setq ent (handent entity-id)))
-  (if (not ent)
-    (cons nil "Entity not found")
-    (progn
-      (if c:update-block-attribute
-        (progn (c:update-block-attribute ent tag value)
-               (cons T (strcat "{\"tag\":\"" tag "\",\"value\":\"" (mcp-escape-string value) "\"}")))
-        ;; Inline fallback if attribute_tools.lsp not loaded
-        (progn
-          (set_attribute_value ent tag value)
-          (cons T (strcat "{\"tag\":\"" tag "\",\"value\":\"" (mcp-escape-string value) "\"}")))
-      )
+  (cond
+    ((not ent) (cons nil "Entity not found"))
+    ((or (not tag) (not value)) (cons nil "tag and value required"))
+    (t
+     ;; Walk only this insert's own ATTRIB sub-entities. Stopping at the first
+     ;; non-ATTRIB (SEQEND, or the next entity if the insert has no attributes)
+     ;; keeps the edit from reaching other blocks.
+     (setq found nil sub-ent (entnext ent))
+     (while sub-ent
+       (setq ent-data (entget sub-ent))
+       (cond
+         ((/= (cdr (assoc 0 ent-data)) "ATTRIB")
+          (setq sub-ent nil))
+         ((= (strcase (cdr (assoc 2 ent-data))) (strcase tag))
+          (entmod (subst (cons 1 value) (assoc 1 ent-data) ent-data))
+          (entupd sub-ent)
+          (entupd ent)
+          (setq found T sub-ent nil))
+         (t (setq sub-ent (entnext sub-ent)))
+       )
+     )
+     (if found
+       (cons T (strcat "{\"tag\":\"" (mcp-escape-string tag) "\",\"value\":\"" (mcp-escape-string value) "\"}"))
+       (cons nil (strcat "Attribute '" tag "' not found on entity"))
+     )
     )
   )
 )
@@ -1244,7 +1266,7 @@
   (cons T (strcat "{\"blocks\":[" block-list "]}"))
 )
 
-(defun mcp-cmd-block-insert (params / name x y scale rotation block-id)
+(defun mcp-cmd-block-insert (params / name x y scale rotation block-id old-attreq)
   (setq name (mcp-json-get-string params "name"))
   (setq x (mcp-json-get-number params "x"))
   (setq y (mcp-json-get-number params "y"))
@@ -1255,7 +1277,11 @@
   (if (not rotation) (setq rotation 0.0))
   (if (tblsearch "BLOCK" name)
     (progn
+      ;; ATTREQ=0 so a block with attributes does not stop at prompts
+      (setq old-attreq (getvar "ATTREQ"))
+      (setvar "ATTREQ" 0)
       (command "_.INSERT" name (list x y 0.0) scale scale rotation)
+      (setvar "ATTREQ" old-attreq)
       (if (and block-id (> (strlen block-id) 0))
         (set_attribute_value (entlast) "ID" block-id)
       )

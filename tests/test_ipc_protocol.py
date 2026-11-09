@@ -536,3 +536,77 @@ class TestVariableNameStripping:
         names = None
         names_str = "" if not names else ";".join(names)
         assert names_str == ""
+
+
+# ---------------------------------------------------------------------------
+# block.insert_with_attributes on File IPC: insert, then set each attribute
+# ---------------------------------------------------------------------------
+
+
+class TestInsertWithAttributes:
+    @staticmethod
+    def _backend(responses):
+        from autocadss_mcp.backends.base import CommandResult
+        from autocadss_mcp.backends.file_ipc import FileIPCBackend
+
+        backend = FileIPCBackend()
+        calls = []
+
+        async def fake_dispatch(command, params):
+            calls.append((command, params))
+            return responses.get(command, CommandResult(ok=True, payload={}))
+
+        backend._dispatch = fake_dispatch
+        return backend, calls
+
+    @pytest.mark.asyncio
+    async def test_attributes_set_by_handle(self):
+        from autocadss_mcp.backends.base import CommandResult
+
+        backend, calls = self._backend({
+            "block-insert-with-attributes": CommandResult(ok=True, payload={"entity_type": "INSERT", "handle": "2A"}),
+        })
+        result = await backend.block_insert_with_attributes("VALVE", 1, 2, attributes={"TAG": "V-101", "SIZE": 50})
+
+        assert result.ok is True
+        assert result.payload["handle"] == "2A"
+        assert result.payload["attributes"] == {"TAG": "V-101", "SIZE": "50"}
+        assert "attributes" not in calls[0][1]
+        assert calls[1:] == [
+            ("block-update-attribute", {"entity_id": "2A", "tag": "TAG", "value": "V-101"}),
+            ("block-update-attribute", {"entity_id": "2A", "tag": "SIZE", "value": "50"}),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_no_attributes_is_single_dispatch(self):
+        from autocadss_mcp.backends.base import CommandResult
+
+        backend, calls = self._backend({
+            "block-insert-with-attributes": CommandResult(ok=True, payload={"handle": "2A"}),
+        })
+        result = await backend.block_insert_with_attributes("VALVE", 1, 2)
+        assert result.ok is True
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_attribute_is_reported(self):
+        from autocadss_mcp.backends.base import CommandResult
+
+        backend, _ = self._backend({
+            "block-insert-with-attributes": CommandResult(ok=True, payload={"handle": "2A"}),
+            "block-update-attribute": CommandResult(ok=False, error="Attribute 'TAG' not found on entity"),
+        })
+        result = await backend.block_insert_with_attributes("VALVE", 1, 2, attributes={"TAG": "V-101"})
+        assert result.ok is False
+        assert "2A" in result.error and "TAG" in result.error
+
+    @pytest.mark.asyncio
+    async def test_insert_failure_skips_attributes(self):
+        from autocadss_mcp.backends.base import CommandResult
+
+        backend, calls = self._backend({
+            "block-insert-with-attributes": CommandResult(ok=False, error="Block 'VALVE' not found"),
+        })
+        result = await backend.block_insert_with_attributes("VALVE", 1, 2, attributes={"TAG": "V-101"})
+        assert result.ok is False
+        assert len(calls) == 1
