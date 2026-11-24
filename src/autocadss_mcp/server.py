@@ -40,9 +40,15 @@ async def drawing(
     """Drawing file management.
 
     Operations:
-      create     — Create a new empty drawing. data: {name?}
-      open       — Open an existing drawing. data: {path}
-      info       — Get drawing extents, entity count, layers, blocks.
+      new        — Open a NEW drawing in its own tab from a template; the active drawing is left
+                   untouched. data: {template? (default acadiso.dwt), path? (save it there now)}
+                   Full AutoCAD only. Use this to start a new DWG safely.
+      create     — Erase the ACTIVE drawing back to empty (erase all + purge). Refuses when the
+                   drawing has objects unless data.force=true. data: {name?, force?}
+      open       — Open an existing drawing (becomes the active tab). data: {path}
+      info       — Entity count, layers, drawing name/folder, saved_to_disk, unsaved_changes, insunits.
+      set_variables — Set system variables. data: {values: {INSUNITS: 4, LTSCALE: 100, ...}}
+                   Security variables (SECURELOAD, TRUSTEDPATHS, ...) are refused.
       save       — Save current drawing. data: {path?} (saves to path if given, else QSAVE)
       save_as_dxf — Export as DXF. data: {path}
       plot_pdf   — Plot to PDF. data: {path}
@@ -55,7 +61,17 @@ async def drawing(
     backend = await get_backend()
 
     if operation == "create":
-        result = await backend.drawing_create(data.get("name"))
+        if data.get("force"):
+            result = await backend.drawing_create(data.get("name"), force=True)
+        else:
+            result = await backend.drawing_create(data.get("name"))
+    elif operation == "new":
+        result = await backend.drawing_new(data.get("template"), data.get("path"))
+    elif operation == "set_variables":
+        values = data.get("values") or {}
+        if not isinstance(values, dict) or not values:
+            return _json({"error": "data.values must be a non-empty object, e.g. {\"INSUNITS\": 4}"})
+        result = await backend.drawing_set_variables(values)
     elif operation == "info":
         result = await backend.drawing_info()
     elif operation == "save":
@@ -102,7 +118,7 @@ async def entity(
     """Entity creation, querying, and modification.
 
     Create operations:
-      create_line       — x1, y1, x2, y2, layer?
+      create_line       — x1, y1, x2, y2 (top level or in data), layer?
       create_circle     — data: {cx, cy, radius}, layer?
       create_polyline   — points: [[x,y],...], data: {closed?}, layer?
       create_rectangle  — x1, y1, x2, y2, layer?
@@ -133,6 +149,10 @@ async def entity(
 
     # --- Create ---
     if operation == "create_line":
+        # accept data: {x1, y1, x2, y2} too, like every other operation
+        x1, y1, x2, y2 = (v if v is not None else data.get(k) for v, k in ((x1, "x1"), (y1, "y1"), (x2, "x2"), (y2, "y2")))
+        if None in (x1, y1, x2, y2):
+            return _json({"error": "create_line needs x1, y1, x2, y2"})
         result = await backend.create_line(x1, y1, x2, y2, layer)
     elif operation == "create_circle":
         result = await backend.create_circle(data["cx"], data["cy"], data["radius"], layer)
@@ -197,26 +217,41 @@ async def layer(
     """Layer creation and management.
 
     Operations:
-      list            — List all layers with properties.
-      create          — data: {name, color?, linetype?}
+      list            — List all layers: color, linetype, lineweight, on, frozen, locked, plot.
+      create          — data: {name, color?, linetype?, plot?}  A missing linetype (DASHED, HIDDEN,
+                        CENTER, ...) is loaded from acadiso.lin first. plot=false = non-plotting layer.
       set_current     — data: {name}
-      set_properties  — data: {name, color?, linetype?, lineweight?}
-      freeze          — data: {name}
-      thaw            — data: {name}
-      lock            — data: {name}
-      unlock          — data: {name}
+      set_properties  — data: {name, color?, linetype?, lineweight? (e.g. 0.35), plot?, description?}
+      freeze / thaw   — data: {name}
+      lock / unlock   — data: {name}
+      on / off        — data: {name}
+      delete          — Delete an EMPTY, unused layer (purge). Never deletes objects. data: {name}
+      load_linetype   — Load a linetype from acadiso.lin / acad.lin. data: {name}
+      list_linetypes  — Linetypes loaded in the drawing.
     """
     data = data or {}
     backend = await get_backend()
 
+    def _extra(*keys):
+        return {k: data[k] for k in keys if data.get(k) is not None}
+
     if operation == "list":
         result = await backend.layer_list()
     elif operation == "create":
-        result = await backend.layer_create(data["name"], data.get("color", "white"), data.get("linetype", "CONTINUOUS"))
+        result = await backend.layer_create(data["name"], data.get("color", "white"), data.get("linetype", "CONTINUOUS"), **_extra("plot"))
     elif operation == "set_current":
         result = await backend.layer_set_current(data["name"])
     elif operation == "set_properties":
-        result = await backend.layer_set_properties(data["name"], data.get("color"), data.get("linetype"), data.get("lineweight"))
+        result = await backend.layer_set_properties(data["name"], data.get("color"), data.get("linetype"), data.get("lineweight"),
+                                                    **_extra("plot", "description"))
+    elif operation in ("on", "off"):
+        result = await backend.layer_on_off(data["name"], operation == "on")
+    elif operation == "delete":
+        result = await backend.layer_delete(data["name"])
+    elif operation == "load_linetype":
+        result = await backend.linetype_load(data["name"])
+    elif operation == "list_linetypes":
+        result = await backend.linetype_list()
     elif operation == "freeze":
         result = await backend.layer_freeze(data["name"])
     elif operation == "thaw":
@@ -301,6 +336,10 @@ async def annotation(
       create_dimension_angular — data: {cx, cy, x1, y1, x2, y2}
       create_dimension_radius — data: {cx, cy, radius, angle}
       create_leader           — data: {points: [[x,y],...], text}
+      create_text_style       — Create/update a text style. data: {name, font? (arial.ttf), height? (0 = variable), width_factor?}
+      create_dim_style        — Create/redefine a dimension style and make it current.
+                                data: {name, text_height?, arrow_size?, scale? (DIMSCALE, e.g. 100 for 1:100),
+                                       tick_size? (architectural ticks), decimals?, text_style?}
     """
     data = data or {}
     backend = await get_backend()
@@ -328,6 +367,12 @@ async def annotation(
         )
     elif operation == "create_leader":
         result = await backend.create_leader(data["points"], data["text"])
+    elif operation == "create_text_style":
+        result = await backend.text_style_create(data["name"], data.get("font", "arial.ttf"),
+                                                 data.get("height", 0.0), data.get("width_factor", 1.0))
+    elif operation == "create_dim_style":
+        result = await backend.dim_style_create(data["name"], data.get("text_height"), data.get("arrow_size"), data.get("scale"),
+                                                data.get("tick_size"), data.get("decimals"), data.get("text_style"))
     else:
         return _json({"error": f"Unknown annotation operation: {operation}"})
 
@@ -468,7 +513,12 @@ async def system(
     """Server status and management.
 
     Operations:
-      status        — Backend info, capabilities, health check.
+      status        — Read-only: is AutoCAD running, is the dispatcher loaded, backend, capabilities.
+                      Never starts AutoCAD. Call this first.
+      launch        — Start AutoCAD (blank drawing) if it is not running, load the dispatcher, connect.
+                      Any drawing/entity/layer call also does this by itself when AutoCAD is closed.
+      load_dispatcher — Reload autocadss_dispatch.lsp into the active drawing from the trusted autoload bundle
+                      (after an update, or if a drawing lost it). Not arbitrary LISP.
       health        — Quick health check (ping backend).
       get_backend   — Return current backend name and capabilities.
       runtime       — Return process/runtime details for spawn diagnostics.
@@ -478,9 +528,37 @@ async def system(
     data = data or {}
 
     if operation == "status" or operation == "get_backend":
+        from autocadss_mcp import client, launcher
+        from autocadss_mcp.backends.file_ipc import find_autocad_window
+
+        if client._backend is None and launcher.auto_launch_enabled() and not find_autocad_window():
+            exe = launcher.find_acad_exe()
+            return _json({"ok": True, "payload": {
+                "autocad_running": bool(launcher.running_process()),
+                "drawing_open": False,
+                "acad_exe": str(exe) if exe else None,
+                "auto_launch": True,
+                "autoload_bundle": str(launcher.bundle_dir()),
+                "autoload_bundle_installed": (launcher.bundle_dir() / "Contents" / "autocadss_dispatch.lsp").exists(),
+                "next_step": "Any drawing/layer/entity call (or system launch) starts AutoCAD and loads the dispatcher automatically.",
+            }})
         backend = await get_backend()
         result = await backend.status()
+        if result.ok and isinstance(result.payload, dict):
+            result.payload["autocad_running"] = backend.name == "file_ipc"
         return await add_screenshot_if_available(result, include_screenshot)
+    elif operation == "launch":
+        from autocadss_mcp import client
+
+        if client._backend is not None and client._backend.name != "file_ipc":
+            client._backend = None
+        backend = await get_backend()
+        result = await backend.status()
+        return _json(result.to_dict())
+    elif operation == "load_dispatcher":
+        backend = await get_backend()
+        result = await backend.reload_dispatcher()
+        return _json(result.to_dict())
     elif operation == "health":
         try:
             backend = await get_backend()

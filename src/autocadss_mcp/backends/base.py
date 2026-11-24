@@ -84,6 +84,34 @@ class AutoCADBackend(ABC):
     async def drawing_get_variables(self, names: list[str] | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
+    async def drawing_new(self, template: str | None = None, path: str | None = None) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def drawing_set_variables(self, values: dict) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def linetype_load(self, name: str) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def linetype_list(self) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def text_style_create(self, name: str, font: str = "arial.ttf", height: float = 0.0, width_factor: float = 1.0) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def dim_style_create(self, name: str, text_height=None, arrow_size=None, scale=None, tick_size=None,
+                               decimals=None, text_style=None) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def layer_delete(self, name: str) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def layer_on_off(self, name: str, on: bool) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def reload_dispatcher(self) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
     async def drawing_open(self, path: str) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 

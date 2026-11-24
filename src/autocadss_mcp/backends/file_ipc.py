@@ -62,6 +62,8 @@ class FileIPCBackend(AutoCADBackend):
         self._ipc_dir = Path(IPC_DIR)
         self._screenshot_provider = None
         self._lock = asyncio.Lock()  # Single in-flight command
+        self._dispatcher: dict | None = None
+        self._started_by_mcp = False
 
     @property
     def name(self) -> str:
@@ -83,61 +85,120 @@ class FileIPCBackend(AutoCADBackend):
         )
 
     async def initialize(self) -> CommandResult:
-        """Find AutoCAD window and verify dispatcher is loaded."""
-        self._hwnd = find_autocad_window()
-        if not self._hwnd:
-            return CommandResult(ok=False, error="AutoCAD window not found")
+        """Find (or start) AutoCAD, then make sure the dispatcher is loaded — loading it if needed."""
+        async with self._lock:
+            return await self._connect_unlocked()
 
-        # Set up screenshot provider
+    def _attach(self, hwnd: int) -> None:
+        self._hwnd = hwnd
         try:
             from autocadss_mcp.screenshot import Win32ScreenshotProvider
 
             self._screenshot_provider = Win32ScreenshotProvider(self._hwnd)
         except Exception:
             pass
-
         # Find command-line child edit control for focus-free dispatch
         self._command_hwnd = self._find_command_line_hwnd()
         log.info("command_line_hwnd", hwnd=self._command_hwnd)
 
-        # Ensure IPC directory exists
-        self._ipc_dir.mkdir(parents=True, exist_ok=True)
+    async def _connect_unlocked(self, launch: bool = True) -> CommandResult:
+        from autocadss_mcp import launcher
 
-        # Clean up stale IPC files
+        state = await launcher.ensure_running(launch=launch)
+        if not state.get("ok"):
+            return CommandResult(ok=False, error=f"AutoCAD window not found: {state.get('message')}")
+        self._attach(state["hwnd"])
+        self._started_by_mcp = bool(state.get("started"))
+
+        self._ipc_dir.mkdir(parents=True, exist_ok=True)
         self._cleanup_stale_files()
 
-        # Ping the dispatcher to verify it's loaded
-        result = await self._dispatch("ping", {})
+        result = await self._ensure_dispatcher_unlocked()
         if not result.ok:
-            lisp_path = str(LISP_DIR / "autocadss_dispatch.lsp").replace("\\", "/")
-            return CommandResult(
-                ok=False,
-                error=(
-                    "AutoCAD detected but autocadss_dispatch.lsp not loaded.\n"
-                    f'In AutoCAD command line, type:\n  (load "{lisp_path}")\n'
-                    "Or add lisp-code/ to trusted paths for auto-loading."
-                ),
-            )
+            return result
+        return CommandResult(ok=True, payload={"backend": "file_ipc", "hwnd": self._hwnd,
+                                               "started_autocad": self._started_by_mcp, **(result.payload or {})})
 
-        return CommandResult(ok=True, payload={"backend": "file_ipc", "hwnd": self._hwnd})
+    async def _ensure_dispatcher_unlocked(self, force_reload: bool = False) -> CommandResult:
+        """Ping; if the dispatcher is missing (or force_reload), load it from the trusted bundle and ping again."""
+        from autocadss_mcp import launcher
+
+        if not force_reload:
+            ping = await self._dispatch_unlocked("ping", {}, timeout=4.0)
+            if ping.ok:
+                self._dispatcher = ping.payload if isinstance(ping.payload, dict) else {"pong": True}
+                return CommandResult(ok=True, payload={"dispatcher": self._dispatcher, "loaded_now": False})
+
+        bundle = launcher.install_bundle()
+        files = launcher.dispatcher_files()
+        log.info("loading_dispatcher", files=files)
+        for f in files:
+            self._post_line(f'(load "{f}")')
+            await asyncio.sleep(1.0)
+        ping = None
+        for _ in range(3):
+            ping = await self._dispatch_unlocked("ping", {}, timeout=6.0)
+            if ping.ok:
+                break
+        if ping and ping.ok:
+            self._dispatcher = ping.payload if isinstance(ping.payload, dict) else {"pong": True}
+            return CommandResult(ok=True, payload={"dispatcher": self._dispatcher, "loaded_now": True, "bundle": bundle.get("path")})
+        return CommandResult(
+            ok=False,
+            error=(
+                "AutoCAD is open but autocadss_dispatch.lsp could not be loaded automatically "
+                f"(tried {', '.join(files) or 'no files'}). AutoCAD may be busy in a command or a dialog. "
+                "Press ESC in AutoCAD and call system(operation='load_dispatcher')."
+            ),
+        )
+
+    async def _ensure_connected_unlocked(self) -> CommandResult | None:
+        """AutoCAD was closed or restarted since the last call: find/start it again. None when all is well."""
+        try:
+            import win32gui
+
+            alive = bool(self._hwnd) and win32gui.IsWindow(self._hwnd)
+        except ImportError:
+            alive = True
+        if alive:
+            return None
+        log.info("autocad_window_lost_reconnecting")
+        result = await self._connect_unlocked()
+        return None if result.ok else result
 
     async def status(self) -> CommandResult:
+        from autocadss_mcp import launcher
+
         info = {
             "backend": "file_ipc",
             "hwnd": self._hwnd,
             "ipc_dir": str(self._ipc_dir),
+            "dispatcher": getattr(self, "_dispatcher", None),
+            "autoload_bundle": str(launcher.bundle_dir()),
+            "autoload_bundle_installed": (launcher.bundle_dir() / "Contents" / "autocadss_dispatch.lsp").exists(),
+            "started_autocad": getattr(self, "_started_by_mcp", False),
             "capabilities": {k: v for k, v in self.capabilities.__dict__.items()},
         }
         return CommandResult(ok=True, payload=info)
 
+    async def reload_dispatcher(self) -> CommandResult:
+        async with self._lock:
+            lost = await self._ensure_connected_unlocked()
+            if lost:
+                return lost
+            return await self._ensure_dispatcher_unlocked(force_reload=True)
+
     # --- IPC dispatch ---
 
-    async def _dispatch(self, command: str, params: dict) -> CommandResult:
-        """Send a command via file IPC and wait for result."""
+    async def _dispatch(self, command: str, params: dict, timeout: float | None = None) -> CommandResult:
+        """Send a command via file IPC and wait for result. Reconnects if AutoCAD was closed."""
         async with self._lock:
-            return await self._dispatch_unlocked(command, params)
+            lost = await self._ensure_connected_unlocked()
+            if lost:
+                return lost
+            return await self._dispatch_unlocked(command, params, timeout=timeout)
 
-    async def _dispatch_unlocked(self, command: str, params: dict) -> CommandResult:
+    async def _dispatch_unlocked(self, command: str, params: dict, timeout: float | None = None) -> CommandResult:
         """Core IPC logic (must be called under _lock)."""
         request_id = uuid.uuid4().hex[:12]
         cmd_file = self._ipc_dir / f"autocadss_mcp_cmd_{request_id}.json"
@@ -147,6 +208,11 @@ class FileIPCBackend(AutoCADBackend):
         try:
             # Strip None values — the simple LISP JSON parser can't handle null
             clean_params = {k: v for k, v in params.items() if v is not None}
+            # The LISP JSON reader does not unescape "\\", so Windows paths would arrive doubled.
+            # AutoCAD accepts forward slashes everywhere, so send paths that way.
+            for k, v in clean_params.items():
+                if isinstance(v, str) and ("path" in k or k == "code_file"):
+                    clean_params[k] = v.replace("\\", "/")
             # Atomic write: write to .tmp, then rename
             payload = {
                 "request_id": request_id,
@@ -161,8 +227,17 @@ class FileIPCBackend(AutoCADBackend):
             self._type_dispatch_trigger()
 
             # Poll for result
-            deadline = time.time() + TIMEOUT
+            wait = timeout or TIMEOUT
+            deadline = time.time() + wait
+            retrigger_at = time.time() + min(3.0, wait / 2)
             while time.time() < deadline:
+                # AutoCAD was busy and dropped the trigger (the command file is still unclaimed):
+                # post it once more. Safe — the dispatcher deletes a command file when it runs it,
+                # so a command can never run twice.
+                if retrigger_at and time.time() >= retrigger_at:
+                    retrigger_at = 0
+                    if cmd_file.exists():
+                        self._type_dispatch_trigger()
                 if result_file.exists():
                     try:
                         # AutoCAD LISP writes files in Windows-1252 encoding;
@@ -214,7 +289,10 @@ class FileIPCBackend(AutoCADBackend):
             return None
 
     def _type_dispatch_trigger(self):
-        """Post '(c:autocadss-dispatch)' + Enter via WM_CHAR to MDIClient — no focus steal.
+        self._post_line("(c:autocadss-dispatch)")
+
+    def _post_line(self, line: str):
+        """Post a command line + Enter via WM_CHAR to MDIClient — no focus steal.
 
         Sends ESC keystrokes first to cancel any stale pending command
         (e.g. from a previous timeout leaving AutoCAD in a command prompt).
@@ -235,7 +313,7 @@ class FileIPCBackend(AutoCADBackend):
                 post(target, WM_KEYUP, VK_ESCAPE, 0)
             time.sleep(0.05)
 
-            for ch in "(c:autocadss-dispatch)":
+            for ch in line:
                 post(target, WM_CHAR, ord(ch), 0)
             # Enter = carriage return
             post(target, WM_CHAR, 0x0D, 0)
@@ -265,8 +343,42 @@ class FileIPCBackend(AutoCADBackend):
     async def drawing_save_as_dxf(self, path: str) -> CommandResult:
         return await self._dispatch("drawing-save-as-dxf", {"path": path})
 
-    async def drawing_create(self, name: str | None = None) -> CommandResult:
-        return await self._dispatch("drawing-create", {"name": name})
+    async def drawing_create(self, name: str | None = None, force: bool = False) -> CommandResult:
+        return await self._dispatch("drawing-create", {"name": name, "force": "1" if force else None})
+
+    async def _after_document_switch(self, expect: str | None, wait_s: float = 45.0) -> CommandResult:
+        """A drawing was opened/created in its own tab: wait for its window title, then make sure its
+        dispatcher is loaded (the autoloader normally does this; otherwise it is loaded here)."""
+        import win32gui
+
+        began = time.time()
+        while time.time() - began < wait_s:
+            hwnd = find_autocad_window()
+            title = win32gui.GetWindowText(hwnd).lower() if hwnd else ""
+            if hwnd and (not expect or expect.lower() in title):
+                self._attach(hwnd)
+                await asyncio.sleep(1.5)
+                async with self._lock:
+                    res = await self._ensure_dispatcher_unlocked()
+                if res.ok:
+                    return CommandResult(ok=True, payload={"drawing": self._dispatcher.get("drawing") if self._dispatcher else None,
+                                                           "window": win32gui.GetWindowText(hwnd)})
+                return res
+            await asyncio.sleep(1.0)
+        return CommandResult(ok=False, error=f"The drawing {expect or ''} did not become the active AutoCAD window within {int(wait_s)} s")
+
+    async def drawing_new(self, template: str | None = None, path: str | None = None) -> CommandResult:
+        res = await self._dispatch("drawing-new", {"template": template, "path": path}, timeout=30.0)
+        if not res.ok and "Timeout" not in (res.error or ""):
+            return res
+        expect = None
+        if res.ok and isinstance(res.payload, dict):
+            expect = Path(str(res.payload.get("drawing", ""))).stem or None
+        switched = await self._after_document_switch(expect)
+        if not switched.ok:
+            return switched
+        payload = res.payload if res.ok and isinstance(res.payload, dict) else {}
+        return CommandResult(ok=True, payload={**payload, **(switched.payload or {}), "dispatcher_ready": True})
 
     async def drawing_purge(self) -> CommandResult:
         return await self._dispatch("drawing-purge", {})
@@ -284,7 +396,38 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("drawing-get-variables", {"names_str": names_str})
 
     async def drawing_open(self, path: str) -> CommandResult:
-        return await self._dispatch("drawing-open", {"path": path})
+        # OPEN switches AutoCAD to a new document, so the calling LISP may never write its result:
+        # a timeout here is normal. Success is judged by the window title, then the new tab's dispatcher.
+        if not Path(path).exists():
+            return CommandResult(ok=False, error=f"File not found: {path}")
+        res = await self._dispatch("drawing-open", {"path": path}, timeout=8.0)
+        if not res.ok and "Timeout" not in (res.error or ""):
+            return res
+        switched = await self._after_document_switch(Path(path).stem)
+        if not switched.ok:
+            return switched
+        return CommandResult(ok=True, payload={"opened": path, **(switched.payload or {})})
+
+    async def drawing_set_variables(self, values: dict) -> CommandResult:
+        pairs = ";".join(f"{k}={v}" for k, v in values.items())
+        return await self._dispatch("drawing-set-variables", {"pairs_str": pairs})
+
+    # --- Linetypes / styles ---
+
+    async def linetype_load(self, name: str) -> CommandResult:
+        return await self._dispatch("linetype-load", {"name": name}, timeout=20.0)
+
+    async def linetype_list(self) -> CommandResult:
+        return await self._dispatch("linetype-list", {})
+
+    async def text_style_create(self, name: str, font: str = "arial.ttf", height: float = 0.0, width_factor: float = 1.0) -> CommandResult:
+        return await self._dispatch("text-style-create", {"name": name, "font": font, "height": height, "width_factor": width_factor})
+
+    async def dim_style_create(self, name: str, text_height=None, arrow_size=None, scale=None, tick_size=None,
+                               decimals=None, text_style=None) -> CommandResult:
+        return await self._dispatch("dim-style-create", {"name": name, "text_height": text_height, "arrow_size": arrow_size,
+                                                         "scale": scale, "tick_size": tick_size, "decimals": decimals,
+                                                         "text_style": text_style})
 
     # --- Undo / Redo ---
 
@@ -381,14 +524,32 @@ class FileIPCBackend(AutoCADBackend):
     async def layer_list(self) -> CommandResult:
         return await self._dispatch("layer-list", {})
 
-    async def layer_create(self, name, color="white", linetype="CONTINUOUS") -> CommandResult:
-        return await self._dispatch("layer-create", {"name": name, "color": color, "linetype": linetype})
+    @staticmethod
+    def _flag(value) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return "0" if value.strip().lower() in ("0", "false", "no", "off") else "1"
+        return "1" if value else "0"
+
+    async def layer_create(self, name, color="white", linetype="CONTINUOUS", plot=None) -> CommandResult:
+        return await self._dispatch("layer-create", {"name": name, "color": str(color), "linetype": linetype, "plot": self._flag(plot)},
+                                    timeout=max(TIMEOUT, 20.0))
 
     async def layer_set_current(self, name) -> CommandResult:
         return await self._dispatch("layer-set-current", {"name": name})
 
-    async def layer_set_properties(self, name, color=None, linetype=None, lineweight=None) -> CommandResult:
-        return await self._dispatch("layer-set-properties", {"name": name, "color": color, "linetype": linetype, "lineweight": lineweight})
+    async def layer_set_properties(self, name, color=None, linetype=None, lineweight=None, plot=None, description=None) -> CommandResult:
+        return await self._dispatch("layer-set-properties", {"name": name, "color": None if color is None else str(color),
+                                                             "linetype": linetype, "lineweight": None if lineweight is None else str(lineweight),
+                                                             "plot": self._flag(plot), "description": description},
+                                    timeout=max(TIMEOUT, 20.0))
+
+    async def layer_delete(self, name) -> CommandResult:
+        return await self._dispatch("layer-delete", {"name": name})
+
+    async def layer_on_off(self, name, on: bool) -> CommandResult:
+        return await self._dispatch("layer-on-off", {"name": name, "on": "1" if on else "0"})
 
     async def layer_freeze(self, name) -> CommandResult:
         return await self._dispatch("layer-freeze", {"name": name})
