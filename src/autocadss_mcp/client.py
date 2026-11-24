@@ -31,13 +31,28 @@ async def get_backend() -> AutoCADBackend:
     when multiple MCP tool calls arrive simultaneously.
     """
     global _backend
-    if _backend is not None:
+    from autocadss_mcp import launcher
+    from autocadss_mcp.config import _current_backend_env
+
+    wants_autocad = (launcher.auto_launch_enabled() and _current_backend_env() in ("auto", "file_ipc")
+                     and launcher.find_acad_exe() is not None)
+    if _backend is not None and not (_backend.name == "ezdxf" and wants_autocad):
         return _backend
 
     async with _init_lock:
         # Double-check after acquiring lock (another task may have initialized)
-        if _backend is not None:
+        if _backend is not None and not (_backend.name == "ezdxf" and wants_autocad):
             return _backend
+
+        state: dict = {}
+        if wants_autocad:
+            # Start AutoCAD (or wait for one that is starting) before choosing the backend,
+            # so a closed AutoCAD no longer silently falls back to the headless ezdxf backend.
+            state = await launcher.ensure_running()
+            if not state.get("ok"):
+                log.info("autocad_not_available", reason=state.get("message"))
+                if _backend is not None:
+                    return _backend
 
         backend_name = detect_backend()
 
@@ -54,6 +69,8 @@ async def get_backend() -> AutoCADBackend:
         if not result.ok:
             raise RuntimeError(f"Backend init failed: {result.error}")
 
+        if state.get("started") and hasattr(backend, "_started_by_mcp"):
+            backend._started_by_mcp = True
         _backend = backend
         log.info("backend_initialized", backend=_backend.name)
         return _backend
@@ -106,6 +123,10 @@ def _safe(tool_name: str):
         async def wrapper(*args, **kwargs):
             op = kwargs.get("operation", "unknown")
             try:
+                # Starting AutoCAD can take minutes; do it before the per-call timeout starts.
+                # `system` is excluded so `system status` never starts AutoCAD.
+                if tool_name != "system" or op == "launch":
+                    await get_backend()
                 return await asyncio.wait_for(fn(*args, **kwargs), TOOL_TIMEOUT)
             except asyncio.TimeoutError:
                 log.error("tool_timeout", tool=tool_name, operation=op, seconds=TOOL_TIMEOUT)

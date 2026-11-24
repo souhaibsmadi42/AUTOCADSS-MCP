@@ -21,6 +21,8 @@
 
 ;; IPC directory
 (setq *autocadss-ipc-dir* "C:/temp/")
+(setq *autocadss-dispatch-version* "3.2")
+(if vl-load-com (vl-catch-all-apply 'vl-load-com nil))
 
 ;; -----------------------------------------------------------------------
 ;; JSON-like output helpers (minimal, no external library)
@@ -172,12 +174,39 @@
 ;; Command dispatcher — whitelist; only "execute-lisp" runs arbitrary code
 ;; -----------------------------------------------------------------------
 
-(defun autocadss-dispatch-command (cmd-name params-json / result)
+(defun autocadss-dispatch-command (cmd-name params-json / result path res)
   "Dispatch a command by name. Returns (ok . payload-or-error)."
   (cond
     ;; --- Ping ---
     ((= cmd-name "ping")
-     (cons T "\"pong\""))
+     (cons T (strcat "{\"pong\":true,\"dispatcher\":\"" *autocadss-dispatch-version* "\",\"product\":\""
+                     (mcp-escape-string (getvar "PRODUCT")) "\",\"acadver\":\"" (getvar "ACADVER")
+                     "\",\"drawing\":\"" (mcp-escape-string (getvar "DWGNAME")) "\"}")))
+
+    ;; --- v3.2 additions ---
+    ((= cmd-name "linetype-load")
+     (mcp-cmd-linetype-load params-json))
+
+    ((= cmd-name "linetype-list")
+     (mcp-cmd-linetype-list))
+
+    ((= cmd-name "drawing-new")
+     (mcp-cmd-drawing-new params-json))
+
+    ((= cmd-name "drawing-set-variables")
+     (mcp-cmd-drawing-set-variables params-json))
+
+    ((= cmd-name "text-style-create")
+     (mcp-cmd-text-style-create params-json))
+
+    ((= cmd-name "dim-style-create")
+     (mcp-cmd-dim-style-create params-json))
+
+    ((= cmd-name "layer-delete")
+     (mcp-cmd-layer-delete params-json))
+
+    ((= cmd-name "layer-on-off")
+     (mcp-cmd-layer-on-off params-json))
 
     ;; --- Freehand LISP execution ---
     ((= cmd-name "execute-lisp")
@@ -328,13 +357,24 @@
     ((= cmd-name "drawing-open")
      (progn
        (setq path (mcp-json-get-string params-json "path"))
-       (if path
-         (progn
-           (setvar "FILEDIA" 0)
-           (command "_.OPEN" path)
-           (setvar "FILEDIA" 1)
-           (cons T (strcat "\"opened: " (mcp-escape-string path) "\"")))
-         (cons nil "Path required"))))
+       (cond
+         ((not path) (cons nil "Path required"))
+         ((not (findfile path)) (cons nil (strcat "File not found: " path)))
+         ;; Full AutoCAD (v3.2): OPEN via (command) is ignored in MDI, so open through ActiveX
+         (vlax-get-acad-object
+          (setq res (vl-catch-all-apply 'vla-open
+                      (list (vla-get-documents (vlax-get-acad-object)) (vl-string-translate "/" "\\" path) :vlax-false)))
+          (if (vl-catch-all-error-p res)
+            (cons nil (strcat "Could not open " path ": " (vl-catch-all-error-message res)))
+            (progn
+              (vl-catch-all-apply 'vla-activate (list res))
+              (cons T (strcat "{\"opened\":\"" (mcp-escape-string path) "\",\"drawing\":\"" (mcp-escape-string (vla-get-name res)) "\"}")))))
+         ;; AutoCAD LT: no ActiveX
+         (t
+          (setvar "FILEDIA" 0)
+          (command "_.OPEN" path)
+          (setvar "FILEDIA" 1)
+          (cons T (strcat "\"opened: " (mcp-escape-string path) "\""))))))
 
     ;; --- P&ID ---
     ((= cmd-name "pid-setup-layers")
@@ -430,8 +470,8 @@
 ;; Command implementations
 ;; -----------------------------------------------------------------------
 
-(defun mcp-cmd-drawing-info ( / count layers layer-list)
-  "Return drawing info: entity count, layers, extents."
+(defun mcp-cmd-drawing-info ( / count layers layer-list ent)
+  "Return drawing info: entity count, layers, file state."
   (setq count 0)
   (setq ent (entnext))
   (while ent
@@ -447,32 +487,56 @@
     )
     (setq layers (tblnext "LAYER"))
   )
-  (cons T (strcat "{\"entity_count\":" (itoa count) ",\"layers\":[" layer-list "]}"))
+  (cons T (strcat "{\"entity_count\":" (itoa count) ",\"layers\":[" layer-list "]"
+                  ",\"drawing\":\"" (mcp-escape-string (getvar "DWGNAME")) "\""
+                  ",\"folder\":\"" (mcp-escape-string (getvar "DWGPREFIX")) "\""
+                  ",\"saved_to_disk\":" (if (= (getvar "DWGTITLED") 1) "true" "false")
+                  ",\"unsaved_changes\":" (if (/= (getvar "DBMOD") 0) "true" "false")
+                  ",\"insunits\":" (itoa (getvar "INSUNITS")) "}"))
 )
 
-(defun mcp-cmd-layer-list ( / layers layer-list name)
-  "Return all layers as JSON array."
+(defun mcp-cmd-layer-list ( / layers layer-list name rec flags plot lt item)
+  "Return all layers as JSON array with color, linetype, lineweight and state flags."
   (setq layer-list "")
   (setq layers (tblnext "LAYER" T))
   (while layers
     (setq name (cdr (assoc 2 layers)))
+    (setq flags (cdr (assoc 70 layers)))
+    (setq lt (cdr (assoc 6 layers)))
+    (setq rec (entget (tblobjname "LAYER" name)))
+    (setq plot (if (assoc 290 rec) (cdr (assoc 290 rec)) 1))
+    (setq item (strcat "{\"name\":\"" (mcp-escape-string name) "\""
+                       ",\"color\":" (itoa (abs (cdr (assoc 62 layers))))
+                       ",\"linetype\":\"" (mcp-escape-string (if lt lt "")) "\""
+                       ",\"lineweight\":" (itoa (if (assoc 370 rec) (cdr (assoc 370 rec)) -3))
+                       ",\"on\":" (if (< (cdr (assoc 62 layers)) 0) "false" "true")
+                       ",\"frozen\":" (if (= 1 (logand flags 1)) "true" "false")
+                       ",\"locked\":" (if (= 4 (logand flags 4)) "true" "false")
+                       ",\"plot\":" (if (= plot 0) "false" "true") "}"))
     (if (> (strlen layer-list) 0)
-      (setq layer-list (strcat layer-list ",{\"name\":\"" name "\",\"color\":" (itoa (cdr (assoc 62 layers))) "}"))
-      (setq layer-list (strcat "{\"name\":\"" name "\",\"color\":" (itoa (cdr (assoc 62 layers))) "}"))
+      (setq layer-list (strcat layer-list "," item))
+      (setq layer-list item)
     )
     (setq layers (tblnext "LAYER"))
   )
   (cons T (strcat "{\"layers\":[" layer-list "]}"))
 )
 
-(defun mcp-cmd-layer-create (params / name color linetype)
+(defun mcp-cmd-layer-create (params / name color linetype plot lt-ok)
   (setq name (mcp-json-get-string params "name"))
   (setq color (mcp-json-get-string params "color"))
   (setq linetype (mcp-json-get-string params "linetype"))
+  (setq plot (mcp-json-get-string params "plot"))
   (if (not color) (setq color "white"))
   (if (not linetype) (setq linetype "CONTINUOUS"))
+  (setq lt-ok (mcp-ensure-linetype linetype))
+  (if (not lt-ok) (setq linetype "CONTINUOUS"))
   (ensure_layer_exists name color linetype)
-  (cons T (strcat "{\"name\":\"" name "\"}"))
+  (if (= plot "0") (command "_.-LAYER" "_PLOT" "_NO" name ""))
+  (if (= plot "1") (command "_.-LAYER" "_PLOT" "_PLOT" name ""))
+  (cons T (strcat "{\"name\":\"" (mcp-escape-string name) "\",\"linetype\":\"" (mcp-escape-string linetype) "\""
+                  (if lt-ok "" ",\"warning\":\"linetype could not be loaded, CONTINUOUS used\"")
+                  ",\"plot\":" (if (= plot "0") "false" "true") "}"))
 )
 
 (defun mcp-cmd-layer-set-current (params / name)
@@ -490,8 +554,12 @@
   (if layer
     (progn (ensure_layer_exists layer "white" "CONTINUOUS") (set_current_layer layer))
   )
-  (command "_LINE" (list x1 y1 0.0) (list x2 y2 0.0) "")
-  (cons T (strcat "{\"entity_type\":\"LINE\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
+  ;; v3.2: entmake, not the LINE command (LINE could fail silently and the old code then
+  ;; returned the handle of the previous object)
+  (if (entmake (list '(0 . "LINE") (cons 8 (getvar "CLAYER")) (list 10 x1 y1 0.0) (list 11 x2 y2 0.0)))
+    (cons T (strcat "{\"entity_type\":\"LINE\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
+    (cons nil "LINE could not be created")
+  )
 )
 
 (defun mcp-cmd-create-circle (params / cx cy radius layer)
@@ -646,16 +714,24 @@
 
 ;; --- Drawing create implementation ---
 
-(defun mcp-cmd-drawing-create (params / ss)
+(defun mcp-cmd-drawing-create (params / ss force n)
   "Reset current drawing to a clean state (erase all, purge, reset to layer 0).
-   Using _.NEW would create a new document tab with a fresh LISP namespace,
-   breaking the IPC dispatcher. This approach preserves the dispatcher."
-  (if (setq ss (ssget "_X"))
-    (progn (command "_.ERASE" ss "") (setq ss nil))
+   SAFETY (v3.2): refuses when the active drawing has content, unless force=1.
+   Use drawing-new for a separate new drawing that leaves the active one alone."
+  (setq force (mcp-json-get-string params "force"))
+  (setq ss (ssget "_X"))
+  (setq n (if ss (sslength ss) 0))
+  (if (and (> n 0) (/= force "1"))
+    (cons nil (strcat "The active drawing " (getvar "DWGNAME") " has " (itoa n)
+                      " objects. drawing.create would erase them. Use drawing.new for a separate new drawing,"
+                      " or pass force=true only if erasing this drawing is intended."))
+    (progn
+      (if ss (progn (command "_.ERASE" ss "") (setq ss nil)))
+      (setvar "CLAYER" "0")
+      (command "_.-PURGE" "_ALL" "*" "_N")
+      (cons T (strcat "{\"drawing\":\"" (mcp-escape-string (getvar "DWGNAME")) "\",\"erased\":" (itoa n) "}"))
+    )
   )
-  (setvar "CLAYER" "0")
-  (command "_.-PURGE" "_ALL" "*" "_N")
-  (cons T (strcat "{\"drawing\":\"" (mcp-escape-string (getvar "DWGNAME")) "\"}"))
 )
 
 ;; --- P&ID command implementations ---
@@ -994,15 +1070,23 @@
 
 ;; --- Layer operations ---
 
-(defun mcp-cmd-layer-set-properties (params / name color linetype lineweight)
+(defun mcp-cmd-layer-set-properties (params / name color linetype lineweight plot desc)
   (setq name (mcp-json-get-string params "name"))
   (setq color (mcp-json-get-string params "color"))
   (setq linetype (mcp-json-get-string params "linetype"))
   (setq lineweight (mcp-json-get-string params "lineweight"))
+  (setq plot (mcp-json-get-string params "plot"))
+  (setq desc (mcp-json-get-string params "description"))
   (if color (command "_.-LAYER" "_COLOR" color name ""))
-  (if linetype (command "_.-LAYER" "_LTYPE" linetype name ""))
+  (if (and linetype (mcp-ensure-linetype linetype)) (command "_.-LAYER" "_LTYPE" linetype name ""))
   (if lineweight (command "_.-LAYER" "_LWEIGHT" lineweight name ""))
-  (cons T (strcat "{\"name\":\"" name "\"}"))
+  (if (= plot "0") (command "_.-LAYER" "_PLOT" "_NO" name ""))
+  (if (= plot "1") (command "_.-LAYER" "_PLOT" "_PLOT" name ""))
+  (if desc (command "_.-LAYER" "_DESCRIPTION" desc name ""))
+  (cons T (strcat "{\"name\":\"" (mcp-escape-string name) "\""
+                  (if (and linetype (not (tblsearch "LTYPE" linetype)))
+                    (strcat ",\"warning\":\"linetype " (mcp-escape-string linetype) " could not be loaded\"") "")
+                  "}"))
 )
 
 (defun mcp-cmd-layer-freeze (params / name)
@@ -1295,7 +1379,7 @@
 ;; Main dispatcher — called by "(c:autocadss-dispatch)" from Python
 ;; -----------------------------------------------------------------------
 
-(defun c:autocadss-dispatch ( / cmd-files cmd-file json-text request-id cmd-name params-str result result-file)
+(defun c:autocadss-dispatch ( / cmd-files cmd-file json-text request-id cmd-name params-str result result-file old-osmode)
   "Find pending command file, dispatch, write result."
   ;; Find first pending command file
   (setq cmd-files (vl-directory-files *autocadss-ipc-dir* "autocadss_mcp_cmd_*.json" 1))
@@ -1305,6 +1389,8 @@
       ;; Process first command
       (setq cmd-file (strcat *autocadss-ipc-dir* (car cmd-files)))
       (setq json-text (mcp-read-file-lines cmd-file))
+      ;; Claim the command before running it (v3.2): Python re-triggers only while the file is unclaimed
+      (if json-text (vl-file-delete cmd-file))
 
       (if (not json-text)
         (princ "\nMCP: Cannot read command file")
@@ -1319,12 +1405,16 @@
               (princ (strcat "\nMCP: Dispatching " cmd-name " [" request-id "]"))
 
               ;; Execute via whitelist dispatcher
+              ;; v3.2: object snaps off while the command runs, so (command ...) points are exact
+              (setq old-osmode (getvar "OSMODE"))
+              (setvar "OSMODE" 0)
               (setq result
                 (vl-catch-all-apply
                   'autocadss-dispatch-command
                   (list cmd-name json-text)
                 )
               )
+              (setvar "OSMODE" old-osmode)
 
               ;; Handle error from vl-catch-all-apply
               (if (vl-catch-all-error-p result)
@@ -1394,10 +1484,233 @@
 )
 
 ;; -----------------------------------------------------------------------
+;; v3.2 additions: linetypes, plot flag, new drawing, styles, variables
+;; -----------------------------------------------------------------------
+
+(defun mcp-ensure-linetype (lt / up old-filedia old-cmdecho)
+  "Make sure linetype LT is loaded, from the standard .lin files. Returns T when available."
+  (if (not lt) T
+    (progn
+      (setq up (strcase lt))
+      (cond
+        ((member up '("CONTINUOUS" "BYLAYER" "BYBLOCK")) T)
+        ((tblsearch "LTYPE" lt) T)
+        (t
+         (setq old-filedia (getvar "FILEDIA") old-cmdecho (getvar "CMDECHO"))
+         (setvar "FILEDIA" 0)
+         (setvar "CMDECHO" 0)
+         (foreach f '("acadiso.lin" "acad.lin" "acadltiso.lin" "acadlt.lin")
+           (if (and (not (tblsearch "LTYPE" lt)) (findfile f))
+             (progn
+               (command "_.-LINETYPE" "_LOAD" lt (findfile f) "")
+               (while (> (getvar "CMDACTIVE") 0) (command ""))
+             )
+           )
+         )
+         (setvar "FILEDIA" old-filedia)
+         (setvar "CMDECHO" old-cmdecho)
+         (if (tblsearch "LTYPE" lt) T nil)
+        )
+      )
+    )
+  )
+)
+
+(defun mcp-cmd-linetype-load (params / name)
+  (setq name (mcp-json-get-string params "name"))
+  (if (not name)
+    (cons nil "name is required (e.g. DASHED, HIDDEN, CENTER)")
+    (if (mcp-ensure-linetype name)
+      (cons T (strcat "{\"linetype\":\"" (mcp-escape-string name) "\",\"loaded\":true}"))
+      (cons nil (strcat "Linetype " name " is not in acadiso.lin / acad.lin"))
+    )
+  )
+)
+
+(defun mcp-cmd-linetype-list ( / rec out item)
+  (setq out "" rec (tblnext "LTYPE" T))
+  (while rec
+    (setq item (strcat "{\"name\":\"" (mcp-escape-string (cdr (assoc 2 rec)))
+                       "\",\"description\":\"" (mcp-escape-string (cdr (assoc 3 rec))) "\"}"))
+    (setq out (if (> (strlen out) 0) (strcat out "," item) item))
+    (setq rec (tblnext "LTYPE"))
+  )
+  (cons T (strcat "{\"linetypes\":[" out "]}"))
+)
+
+(defun mcp-cmd-drawing-new (params / template path docs doc res tpl)
+  "Open a NEW drawing in its own tab from a template, leaving the active drawing untouched.
+   Optional path: save the new drawing there straight away. Needs full AutoCAD (ActiveX)."
+  (if (not vlax-get-acad-object)
+    (cons nil "drawing.new needs full AutoCAD (ActiveX). On AutoCAD LT open a new drawing by hand, or use drawing.create on an empty drawing.")
+    (progn
+      (setq template (mcp-json-get-string params "template"))
+      (setq path (mcp-json-get-string params "path"))
+      (if (not template) (setq template "acadiso.dwt"))
+      (setq tpl (findfile template))
+      (if (and (not tpl) (getenv "TemplatePath"))
+        (setq tpl (findfile (strcat (getenv "TemplatePath") "\\" template))))
+      (setq docs (vla-get-documents (vlax-get-acad-object)))
+      (setq res (vl-catch-all-apply 'vla-add (list docs (if tpl tpl template))))
+      (if (vl-catch-all-error-p res)
+        (cons nil (strcat "Could not create the drawing from " template ": " (vl-catch-all-error-message res)))
+        (progn
+          (setq doc res)
+          (if path
+            (setq res (vl-catch-all-apply 'vla-saveas (list doc (vl-string-translate "/" "\\" path))))
+            (setq res nil)
+          )
+          (vl-catch-all-apply 'vla-activate (list doc))
+          (if (vl-catch-all-error-p res)
+            (cons nil (strcat "New drawing opened but not saved: " (vl-catch-all-error-message res)))
+            (cons T (strcat "{\"drawing\":\"" (mcp-escape-string (vla-get-name doc))
+                            "\",\"full_name\":\"" (mcp-escape-string (vla-get-fullname doc))
+                            "\",\"template\":\"" (mcp-escape-string (if tpl tpl template)) "\"}"))
+          )
+        )
+      )
+    )
+  )
+)
+
+(defun mcp-cmd-drawing-set-variables (params / pairs-str pairs pair pos name value cur res out bad)
+  "Set system variables: pairs_str = \"NAME=VALUE;NAME=VALUE\". Security variables are refused."
+  (setq pairs-str (mcp-json-get-string params "pairs_str"))
+  (if (not pairs-str)
+    (cons nil "pairs_str is required, e.g. INSUNITS=4;LTSCALE=100")
+    (progn
+      (setq out "" bad "")
+      (foreach pair (mcp-split-string pairs-str ";")
+        (if (setq pos (vl-string-search "=" pair))
+          (progn
+            (setq name (strcase (substr pair 1 pos)) value (substr pair (+ pos 2)))
+            (cond
+              ((member name '("SECURELOAD" "TRUSTEDPATHS" "TRUSTEDDOMAINS" "LEGACYCODESEARCH" "ACADLSPASDOC" "LISPSYS" "LOGFILEMODE"))
+               (setq bad (strcat bad name " refused (security setting); ")))
+              ((null (setq cur (getvar name)))
+               (setq bad (strcat bad name " unknown; ")))
+              (t
+               (setq res (vl-catch-all-apply 'setvar
+                           (list name (cond ((= (type cur) 'INT) (atoi value))
+                                            ((= (type cur) 'REAL) (atof value))
+                                            (t value)))))
+               (if (vl-catch-all-error-p res)
+                 (setq bad (strcat bad name ": " (vl-catch-all-error-message res) "; "))
+                 (setq out (strcat out (if (> (strlen out) 0) "," "") "\"" name "\":\""
+                                   (mcp-escape-string (vl-princ-to-string (getvar name))) "\""))
+               )
+              )
+            )
+          )
+        )
+      )
+      (cons T (strcat "{\"set\":{" out "}" (if (> (strlen bad) 0) (strcat ",\"problems\":\"" (mcp-escape-string bad) "\"") "") "}"))
+    )
+  )
+)
+
+(defun mcp-cmd-text-style-create (params / name font height width rec)
+  "Create or update a text style. font = TTF/SHX file (default arial.ttf), height 0 = variable."
+  (setq name (mcp-json-get-string params "name"))
+  (setq font (mcp-json-get-string params "font"))
+  (setq height (mcp-json-get-number params "height"))
+  (setq width (mcp-json-get-number params "width_factor"))
+  (if (not font) (setq font "arial.ttf"))
+  (if (not height) (setq height 0.0))
+  (if (or (not width) (<= width 0)) (setq width 1.0))
+  (if (not name)
+    (cons nil "name is required")
+    (progn
+      (if (tblsearch "STYLE" name)
+        (progn
+          (setq rec (entget (tblobjname "STYLE" name)))
+          (setq rec (subst (cons 3 font) (assoc 3 rec) rec))
+          (setq rec (subst (cons 40 height) (assoc 40 rec) rec))
+          (setq rec (subst (cons 41 width) (assoc 41 rec) rec))
+          (entmod rec)
+        )
+        (entmake (list '(0 . "STYLE") '(100 . "AcDbSymbolTableRecord") '(100 . "AcDbTextStyleTableRecord")
+                       (cons 2 name) '(70 . 0) (cons 40 height) (cons 41 width) '(50 . 0.0) '(71 . 0)
+                       (cons 42 (if (> height 0) height 2.5)) (cons 3 font) '(4 . "")))
+      )
+      (if (tblsearch "STYLE" name)
+        (cons T (strcat "{\"name\":\"" (mcp-escape-string name) "\",\"font\":\"" (mcp-escape-string font) "\"}"))
+        (cons nil (strcat "Text style " name " could not be created"))
+      )
+    )
+  )
+)
+
+(defun mcp-cmd-dim-style-create (params / name th asz sc tsty tick dec old-cmdecho)
+  "Create (or redefine) a dimension style from the given values and make it current."
+  (setq name (mcp-json-get-string params "name"))
+  (setq th (mcp-json-get-number params "text_height"))
+  (setq asz (mcp-json-get-number params "arrow_size"))
+  (setq sc (mcp-json-get-number params "scale"))
+  (setq tick (mcp-json-get-number params "tick_size"))
+  (setq dec (mcp-json-get-number params "decimals"))
+  (setq tsty (mcp-json-get-string params "text_style"))
+  (if (not name)
+    (cons nil "name is required")
+    (progn
+      (if th (setvar "DIMTXT" th))
+      (if asz (setvar "DIMASZ" asz))
+      (if sc (setvar "DIMSCALE" sc))
+      (if tick (setvar "DIMTSZ" tick))
+      (if dec (setvar "DIMDEC" (fix dec)))
+      (if (and tsty (tblsearch "STYLE" tsty)) (setvar "DIMTXSTY" tsty))
+      (setq old-cmdecho (getvar "CMDECHO"))
+      (setvar "CMDECHO" 0)
+      (if (tblsearch "DIMSTYLE" name)
+        (command "_.-DIMSTYLE" "_SAVE" name "_Y")
+        (command "_.-DIMSTYLE" "_SAVE" name)
+      )
+      (setvar "CMDECHO" old-cmdecho)
+      (if (tblsearch "DIMSTYLE" name)
+        (cons T (strcat "{\"name\":\"" (mcp-escape-string name) "\",\"current\":\"" (mcp-escape-string (getvar "DIMSTYLE")) "\""
+                        (if (and tsty (not (tblsearch "STYLE" tsty))) (strcat ",\"warning\":\"text style " (mcp-escape-string tsty) " does not exist\"") "")
+                        "}"))
+        (cons nil (strcat "Dimension style " name " could not be saved"))
+      )
+    )
+  )
+)
+
+(defun mcp-cmd-layer-delete (params / name)
+  "Delete a layer only if it is empty and unused (purge). Never deletes content."
+  (setq name (mcp-json-get-string params "name"))
+  (cond
+    ((not name) (cons nil "name is required"))
+    ((not (tblsearch "LAYER" name)) (cons nil (strcat "Layer " name " does not exist")))
+    ((= (strcase name) (strcase (getvar "CLAYER"))) (cons nil "Cannot delete the current layer"))
+    (t
+     (command "_.-PURGE" "_LA" name "_N")
+     (if (tblsearch "LAYER" name)
+       (cons nil (strcat "Layer " name " is in use (has objects or references) and was not deleted"))
+       (cons T (strcat "{\"name\":\"" (mcp-escape-string name) "\",\"deleted\":true}"))
+     )
+    )
+  )
+)
+
+(defun mcp-cmd-layer-on-off (params / name on)
+  (setq name (mcp-json-get-string params "name"))
+  (setq on (mcp-json-get-string params "on"))
+  (cond
+    ((not (tblsearch "LAYER" name)) (cons nil (strcat "Layer " name " does not exist")))
+    ((and (= on "0") (= (strcase name) (strcase (getvar "CLAYER")))) (cons nil "Cannot turn the current layer off"))
+    (t
+     (command "_.-LAYER" (if (= on "0") "_OFF" "_ON") name "")
+     (cons T (strcat "{\"name\":\"" (mcp-escape-string name) "\",\"on\":" (if (= on "0") "false" "true") "}"))
+    )
+  )
+)
+
+;; -----------------------------------------------------------------------
 ;; Startup message
 ;; -----------------------------------------------------------------------
 
-(princ "\n=== AUTOCADSS Dispatch loaded ===")
+(princ "\n=== AUTOCADSS Dispatch v3.2 loaded ===")
 (princ "\nIPC directory: ")
 (princ *autocadss-ipc-dir*)
 (princ "\nReady for commands via (c:autocadss-dispatch)")
